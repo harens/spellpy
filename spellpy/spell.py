@@ -12,8 +12,8 @@ from datetime import datetime
 import string
 import logging
 
-logging.basicConfig(level=logging.INFO,
-                    format='[%(asctime)s][%(levelname)s]: %(message)s')
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 sys.setrecursionlimit(10000)
@@ -254,7 +254,7 @@ class LogParser(pickle.Unpickler):
         for LCSObject in ordered_candidates:
             if self.max_lcs_comparisons_per_line is not None and comparisons >= self.max_lcs_comparisons_per_line:
                 skipped_by_guardrail = len(candidate_clusters) - comparisons
-                logging.warning(
+                logger.warning(
                     'LCS guardrail triggered after %s comparisons for a line; skipping %s remaining candidates.',
                     comparisons,
                     skipped_by_guardrail,
@@ -345,7 +345,7 @@ class LogParser(pickle.Unpickler):
 
     def parse(self, logname):
         starttime = datetime.now()
-        logging.info('Parsing file: ' + os.path.join(self.path, logname))
+        logger.info('Parsing file: ' + os.path.join(self.path, logname))
         self.logname = logname
         if not os.path.exists(self.savePath):
             os.makedirs(self.savePath)
@@ -362,7 +362,7 @@ class LogParser(pickle.Unpickler):
             for logclust in logCluL:
                 if max(logclust.logIDL) > self.lastestLineId:
                     self.lastestLineId = max(logclust.logIDL)
-            logging.info(f'Load objects done, lastestLineId: {self.lastestLineId}')
+            logger.info(f'Load objects done, lastestLineId: {self.lastestLineId}')
         else:
             rootNode = Node()
             logCluL = []
@@ -393,8 +393,8 @@ class LogParser(pickle.Unpickler):
                 for raw_line in fin:
                     metrics['raw_lines_seen'] += 1
                     if len(raw_line) > self.text_max_length:
-                        logging.error('Length of log string is too long')
-                        logging.error(raw_line)
+                        logger.error('Length of log string is too long')
+                        logger.error(raw_line)
                         continue
                     if self.date_filter not in raw_line:
                         continue
@@ -460,7 +460,7 @@ class LogParser(pickle.Unpickler):
                             if metrics['input_lines_processed'] else 0.0
                         )
                         percentage = count * 100.0 / total_line if total_line else 100.0
-                        logging.info(
+                        logger.info(
                             'Processed %.1f%% of log lines. lines=%s templates=%s lcs=%s candidates_mean=%.2f candidates_max=%s guardrail_skips=%s',
                             percentage,
                             metrics['input_lines_processed'],
@@ -481,13 +481,13 @@ class LogParser(pickle.Unpickler):
         except OSError:
             pass
 
-        logging.info(f'rootNodePath: {rootNodePath}')
+        logger.info(f'rootNodePath: {rootNodePath}')
         with open(rootNodePath, 'wb') as output:
             pickle.dump(rootNode, output, pickle.HIGHEST_PROTOCOL)
-        logging.info(f'logCluLPath: {logCluLPath}')
+        logger.info(f'logCluLPath: {logCluLPath}')
         with open(logCluLPath, 'wb') as output:
             pickle.dump(logCluL, output, pickle.HIGHEST_PROTOCOL)
-        logging.info('Store objects done.')
+        logger.info('Store objects done.')
 
         elapsed = (datetime.now() - starttime).total_seconds()
         mean_candidates = (
@@ -500,7 +500,7 @@ class LogParser(pickle.Unpickler):
             'elapsed_seconds': elapsed,
             'templates_total': len(logCluL),
         }
-        logging.info(
+        logger.info(
             'Parsing done. [Time taken: %s] metrics=%s',
             datetime.now() - starttime,
             self.parse_metrics,
@@ -516,8 +516,8 @@ class LogParser(pickle.Unpickler):
         with open(log_file, 'r') as fin:
             for line in fin:
                 if len(line) > self.text_max_length:
-                    logging.error('Length of log string is too long')
-                    logging.error(line)
+                    logger.error('Length of log string is too long')
+                    logger.error(line)
                     continue
                 if self.date_filter not in line:
                     # logging.warning(f'{self.date_filter} is not in {line}')
@@ -531,7 +531,7 @@ class LogParser(pickle.Unpickler):
                     log_messages.append(message)
                     linecount += 1
                     if linecount % 10000 == 0 or linecount == total_line:
-                        logging.info('Loaded {0:.1f}% of log lines.'.format(linecount*100/total_line))
+                        logger.info('Loaded {0:.1f}% of log lines.'.format(linecount*100/total_line))
                 except Exception as e:
                     _ = e
                     pass
@@ -579,7 +579,7 @@ class LogParser(pickle.Unpickler):
         try:
             parameter_list = self._get_parameter_list(row, template_regex)
         except Exception as e:
-            logging.error(e)
+            logger.error(e)
             parameter_list = ["TIMEOUT"]
         signal.alarm(0)
         return parameter_list
@@ -592,11 +592,11 @@ class LogParser(pickle.Unpickler):
         return parameter_list
 
     def _parameter_handler(self, signum, frame):
-        logging.error("_get_parameter_list function is hangs!")
+        logger.error("_get_parameter_list function is hangs!")
         raise Exception("TIME OUT!")
 
     def _log_to_dataframe_handler(self, signum, frame):
-        logging.error('log_to_dataframe function is hangs')
+        logger.error('log_to_dataframe function is hangs')
         raise Exception("TIME OUT!")
 
     def _build_event_lookup(self, logClustL):
