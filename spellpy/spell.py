@@ -6,6 +6,8 @@ import signal
 import csv
 import pandas as pd
 import hashlib
+import math
+from collections import defaultdict
 from datetime import datetime
 import string
 import logging
@@ -16,13 +18,16 @@ logging.basicConfig(level=logging.INFO,
 
 sys.setrecursionlimit(10000)
 
+NON_ASCII_RE = re.compile(r'[^\x00-\x7F]+')
+TOKEN_SPLIT_RE = re.compile(r'[\s=:,]')
+
 
 class LCSObject:
     """ Class object to store a log group with the same template
     """
-    def __init__(self, logTemplate='', logIDL=[]):
+    def __init__(self, logTemplate='', logIDL=None):
         self.logTemplate = logTemplate
-        self.logIDL = logIDL
+        self.logIDL = [] if logIDL is None else logIDL
 
 
 class Node:
@@ -54,7 +59,19 @@ class LogParser(pickle.Unpickler):
         savePath : the path of the output file
         tau : how much percentage of tokens matched to merge a log message
     """
-    def __init__(self, indir='./', outdir='./result/', log_format=None, tau=0.5, keep_para=True, text_max_length=4096, logmain=None, date_filter=''):
+    def __init__(
+        self,
+        indir='./',
+        outdir='./result/',
+        log_format=None,
+        tau=0.5,
+        keep_para=True,
+        text_max_length=4096,
+        logmain=None,
+        date_filter='',
+        progress_interval=10000,
+        max_lcs_comparisons_per_line=None,
+    ):
         self.path = indir
         self.logname = None
         self.logmain = logmain
@@ -65,6 +82,93 @@ class LogParser(pickle.Unpickler):
         self.lastestLineId = 0
         self.text_max_length = text_max_length
         self.date_filter = date_filter
+        self.progress_interval = max(1, progress_interval)
+        self.max_lcs_comparisons_per_line = max_lcs_comparisons_per_line
+        self.parse_metrics = {}
+        self._token_to_clusters = defaultdict(set)
+        self._wildcard_clusters = set()
+        self._cluster_meta = {}
+
+    def _template_stats(self, template):
+        const_tokens = [token for token in template if token != '<*>']
+        unique_const_tokens = set(const_tokens)
+        return {
+            'const_count': len(const_tokens),
+            'token_set': unique_const_tokens,
+            'template_len': len(template),
+            'first_const_token': next((token for token in template if token != '<*>'), None),
+        }
+
+    def _register_cluster(self, cluster):
+        stats = self._template_stats(cluster.logTemplate)
+        self._cluster_meta[cluster] = stats
+
+        if stats['const_count'] == 0:
+            self._wildcard_clusters.add(cluster)
+            return
+
+        for token in stats['token_set']:
+            self._token_to_clusters[token].add(cluster)
+
+    def _unregister_cluster(self, cluster):
+        stats = self._cluster_meta.pop(cluster, None)
+        if stats is None:
+            self._wildcard_clusters.discard(cluster)
+            return
+
+        if stats['const_count'] == 0:
+            self._wildcard_clusters.discard(cluster)
+            return
+
+        for token in stats['token_set']:
+            cluster_set = self._token_to_clusters.get(token)
+            if cluster_set is None:
+                continue
+            cluster_set.discard(cluster)
+            if not cluster_set:
+                del self._token_to_clusters[token]
+
+    def _rebuild_match_indexes(self, logCluL):
+        self._token_to_clusters = defaultdict(set)
+        self._wildcard_clusters = set()
+        self._cluster_meta = {}
+        for cluster in logCluL:
+            self._register_cluster(cluster)
+
+    def _tokenize_content(self, content):
+        return [token for token in TOKEN_SPLIT_RE.split(content) if token]
+
+    def _candidate_clusters(self, logCluL, seq, seq_token_set, for_lcs=False):
+        if not logCluL:
+            return []
+
+        if not self._cluster_meta:
+            return list(logCluL)
+
+        if not seq_token_set:
+            return [cluster for cluster in logCluL if cluster in self._wildcard_clusters]
+
+        if for_lcs:
+            unique_seq_tokens = list(dict.fromkeys(seq))
+            unique_token_count = len(unique_seq_tokens)
+            required_overlap = int(math.ceil(self.tau * len(seq)))
+            if unique_token_count < required_overlap:
+                return []
+
+            pivot_count = max(1, unique_token_count - required_overlap + 1)
+            token_freq = self._token_to_clusters
+            pivot_tokens = sorted(
+                unique_seq_tokens,
+                key=lambda token: (len(token_freq.get(token, ())), token),
+            )[:pivot_count]
+        else:
+            pivot_tokens = list(seq_token_set)
+
+        candidate_set = set(self._wildcard_clusters)
+        for token in pivot_tokens:
+            candidate_set.update(self._token_to_clusters.get(token, ()))
+
+        return [cluster for cluster in logCluL if cluster in candidate_set]
 
     def LCS(self, seq1, seq2):
         lengths = [[0 for j in range(len(seq2)+1)] for i in range(len(seq1)+1)]
@@ -91,14 +195,21 @@ class LogParser(pickle.Unpickler):
                 lenOfSeq2 -= 1
         return result
 
-    def SimpleLoopMatch(self, logClustL, seq):
+    def SimpleLoopMatch(self, logClustL, seq, seq_token_set=None):
+        if seq_token_set is None:
+            seq_token_set = set(seq)
+        candidate_clusters = self._candidate_clusters(logClustL, seq, seq_token_set, for_lcs=False)
+        if not candidate_clusters and self._cluster_meta:
+            return None
+        candidate_cluster_set = set(candidate_clusters)
         for logClust in logClustL:
+            if candidate_cluster_set and logClust not in candidate_cluster_set:
+                continue
             if float(len(logClust.logTemplate)) < 0.5 * len(seq):
                 continue
             # Check the template is a subsequence of seq (we use set checking as a proxy here for speedup since
             # incorrect-ordering bad cases rarely occur in logs)
-            token_set = set(seq)
-            if all(token in token_set or token == '<*>' for token in logClust.logTemplate):
+            if all(token in seq_token_set or token == '<*>' for token in logClust.logTemplate):
                 return logClust
         return None
 
@@ -117,17 +228,54 @@ class LogParser(pickle.Unpickler):
 
         return retLogClust
 
-    def LCSMatch(self, LCSMap, seq):
+    def LCSMatch(self, LCSMap, seq, seq_token_set=None, metrics=None):
         retLCSObject = None
 
         maxLen = -1
         maxLCSObject = None
-        set_seq = set(seq)
+        if seq_token_set is None:
+            seq_token_set = set(seq)
         size_seq = len(seq)
-        for LCSObject in LCSMap:
-            set_template = set(LCSObject.logTemplate)
-            if len(set_seq & set_template) < 0.5 * size_seq:
+        candidate_clusters = self._candidate_clusters(LCSMap, seq, seq_token_set, for_lcs=True)
+        comparisons = 0
+        skipped_by_guardrail = 0
+        required_overlap = int(math.ceil(self.tau * size_seq))
+        seq_first_token = seq[0] if seq else None
+
+        def candidate_sort_key(cluster):
+            stats = self._cluster_meta.get(cluster)
+            if stats is None:
+                stats = self._template_stats(cluster.logTemplate)
+            first_token_rank = 0 if seq_first_token is not None and stats['first_const_token'] == seq_first_token else 1
+            return (first_token_rank, -stats['const_count'], stats['template_len'])
+
+        ordered_candidates = sorted(candidate_clusters, key=candidate_sort_key)
+
+        for LCSObject in ordered_candidates:
+            if self.max_lcs_comparisons_per_line is not None and comparisons >= self.max_lcs_comparisons_per_line:
+                skipped_by_guardrail = len(candidate_clusters) - comparisons
+                logging.warning(
+                    'LCS guardrail triggered after %s comparisons for a line; skipping %s remaining candidates.',
+                    comparisons,
+                    skipped_by_guardrail,
+                )
+                break
+
+            set_template = self._cluster_meta.get(LCSObject, {}).get('token_set')
+            if set_template is None:
+                set_template = {token for token in LCSObject.logTemplate if token != '<*>'}
+            const_count = len(set_template)
+            template_len = len(LCSObject.logTemplate)
+            if len(seq_token_set & set_template) < required_overlap:
                 continue
+            if maxLen >= 0:
+                if const_count < maxLen:
+                    continue
+                if const_count == maxLen and maxLCSObject is not None and template_len >= len(maxLCSObject.logTemplate):
+                    continue
+            comparisons += 1
+            if metrics is not None:
+                metrics['total_lcs_comparisons'] += 1
             lcs = self.LCS(seq, LCSObject.logTemplate)
             if len(lcs) > maxLen or (len(lcs) == maxLen and len(LCSObject.logTemplate) < len(maxLCSObject.logTemplate)):
                 maxLen = len(lcs)
@@ -136,6 +284,9 @@ class LogParser(pickle.Unpickler):
         # LCS should be large then tau * len(itself)
         if float(maxLen) >= self.tau * size_seq:
             retLCSObject = maxLCSObject
+
+        if metrics is not None and skipped_by_guardrail:
+            metrics['guardrail_skips'] += skipped_by_guardrail
 
         return retLCSObject
 
@@ -216,6 +367,7 @@ class LogParser(pickle.Unpickler):
             rootNode = Node()
             logCluL = []
             self.lastestLineId = 0
+        self._rebuild_match_indexes(logCluL)
 
         log_file = os.path.join(self.path, self.logname)
         headers, regex = self.generate_logformat_regex(self.logformat)
@@ -224,12 +376,22 @@ class LogParser(pickle.Unpickler):
         total_line = self._count_lines(log_file)
 
         count = 0
+        metrics = {
+            'raw_lines_seen': 0,
+            'input_lines_processed': 0,
+            'templates_created': 0,
+            'total_lcs_comparisons': 0,
+            'candidate_templates_sum': 0,
+            'candidate_templates_max': 0,
+            'guardrail_skips': 0,
+        }
         with open(cache_path, 'w', newline='') as cache_file:
             writer = csv.writer(cache_file)
             writer.writerow(['LineId'] + headers)
 
             with open(log_file, 'r') as fin:
                 for raw_line in fin:
+                    metrics['raw_lines_seen'] += 1
                     if len(raw_line) > self.text_max_length:
                         logging.error('Length of log string is too long')
                         logging.error(raw_line)
@@ -240,7 +402,7 @@ class LogParser(pickle.Unpickler):
                     signal.signal(signal.SIGALRM, self._log_to_dataframe_handler)
                     signal.alarm(1)
                     try:
-                        line = re.sub(r'[^\x00-\x7F]+', '<NASCII>', raw_line)
+                        line = NON_ASCII_RE.sub('<NASCII>', raw_line)
                         match = regex.search(line.strip())
                         if match is None:
                             continue
@@ -253,22 +415,28 @@ class LogParser(pickle.Unpickler):
 
                     logID = self.lastestLineId + count + 1
                     writer.writerow([logID] + message)
-                    logmessageL = list(filter(lambda x: x != '', re.split(r'[\s=:,]', message[content_idx])))
+                    logmessageL = self._tokenize_content(message[content_idx])
                     constLogMessL = [w for w in logmessageL if w != '<*>']
+                    seq_token_set = set(constLogMessL)
+                    candidate_clusters = self._candidate_clusters(logCluL, constLogMessL, seq_token_set, for_lcs=False)
+                    metrics['candidate_templates_sum'] += len(candidate_clusters)
+                    metrics['candidate_templates_max'] = max(metrics['candidate_templates_max'], len(candidate_clusters))
 
                     # Find an existing matched log cluster
                     matchCluster = self.PrefixTreeMatch(rootNode, constLogMessL, 0)
 
                     if matchCluster is None:
-                        matchCluster = self.SimpleLoopMatch(logCluL, constLogMessL)
+                        matchCluster = self.SimpleLoopMatch(candidate_clusters, constLogMessL, seq_token_set=seq_token_set)
 
                         if matchCluster is None:
-                            matchCluster = self.LCSMatch(logCluL, logmessageL)
+                            matchCluster = self.LCSMatch(logCluL, logmessageL, seq_token_set=seq_token_set, metrics=metrics)
 
                             # Match no existing log cluster
                             if matchCluster is None:
                                 newCluster = LCSObject(logTemplate=logmessageL, logIDL=[logID])
                                 logCluL.append(newCluster)
+                                self._register_cluster(newCluster)
+                                metrics['templates_created'] += 1
                                 self.addSeqToPrefixTree(rootNode, newCluster)
                             # Add the new log message to the existing cluster
                             else:
@@ -276,14 +444,32 @@ class LogParser(pickle.Unpickler):
                                                                matchCluster.logTemplate)
                                 if ' '.join(newTemplate) != ' '.join(matchCluster.logTemplate):
                                     self.removeSeqFromPrefixTree(rootNode, matchCluster)
+                                    self._unregister_cluster(matchCluster)
                                     matchCluster.logTemplate = newTemplate
+                                    self._register_cluster(matchCluster)
                                     self.addSeqToPrefixTree(rootNode, matchCluster)
                     if matchCluster and logID not in matchCluster.logIDL:
                         matchCluster.logIDL.append(logID)
 
                     count += 1
-                    if count % 10000 == 0 or count == total_line:
-                        logging.info('Processed {0:.1f}% of log lines.'.format(count * 100.0 / total_line))
+                    metrics['input_lines_processed'] += 1
+                    if count % self.progress_interval == 0 or count == total_line:
+                        cache_file.flush()
+                        mean_candidates = (
+                            metrics['candidate_templates_sum'] / metrics['input_lines_processed']
+                            if metrics['input_lines_processed'] else 0.0
+                        )
+                        percentage = count * 100.0 / total_line if total_line else 100.0
+                        logging.info(
+                            'Processed %.1f%% of log lines. lines=%s templates=%s lcs=%s candidates_mean=%.2f candidates_max=%s guardrail_skips=%s',
+                            percentage,
+                            metrics['input_lines_processed'],
+                            len(logCluL),
+                            metrics['total_lcs_comparisons'],
+                            mean_candidates,
+                            metrics['candidate_templates_max'],
+                            metrics['guardrail_skips'],
+                        )
 
         self._write_outputs(cache_path, logCluL)
 
@@ -303,7 +489,22 @@ class LogParser(pickle.Unpickler):
             pickle.dump(logCluL, output, pickle.HIGHEST_PROTOCOL)
         logging.info('Store objects done.')
 
-        logging.info('Parsing done. [Time taken: {!s}]'.format(datetime.now() - starttime))
+        elapsed = (datetime.now() - starttime).total_seconds()
+        mean_candidates = (
+            metrics['candidate_templates_sum'] / metrics['input_lines_processed']
+            if metrics['input_lines_processed'] else 0.0
+        )
+        self.parse_metrics = {
+            **metrics,
+            'candidate_templates_mean': mean_candidates,
+            'elapsed_seconds': elapsed,
+            'templates_total': len(logCluL),
+        }
+        logging.info(
+            'Parsing done. [Time taken: %s] metrics=%s',
+            datetime.now() - starttime,
+            self.parse_metrics,
+        )
 
     def log_to_dataframe(self, log_file, regex, headers, logformat):
         """ Function to transform log file to dataframe
@@ -323,7 +524,7 @@ class LogParser(pickle.Unpickler):
                     continue
                 signal.signal(signal.SIGALRM, self._log_to_dataframe_handler)
                 signal.alarm(1)
-                line = re.sub(r'[^\x00-\x7F]+', '<NASCII>', line)
+                line = NON_ASCII_RE.sub('<NASCII>', line)
                 try:
                     match = regex.search(line.strip())
                     message = [match.group(header) for header in headers]

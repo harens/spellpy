@@ -3,6 +3,7 @@ import re
 import os
 import tempfile
 import pandas as pd
+from unittest.mock import patch
 from pandas.testing import assert_frame_equal
 from spellpy.spell import LogParser, LCSObject, Node
 
@@ -64,6 +65,9 @@ class TestLogParser(unittest.TestCase):
             self.assertEqual(len(df_structured), 3)
             self.assertEqual(df_structured['EventTemplate'].nunique(), 2)
             self.assertListEqual(df_structured['LineId'].tolist(), [1, 2, 3])
+            self.assertEqual(self.parser.parse_metrics['input_lines_processed'], 3)
+            self.assertEqual(self.parser.parse_metrics['templates_created'], 2)
+            self.assertGreaterEqual(self.parser.parse_metrics['candidate_templates_mean'], 0.0)
 
     def test_addSeqToPrefixTree(self):
         logmessageL = ['Receiving', 'block', 'blk_-1608999687919862906', 'src', '/10.250.19.102', '54106', 'dest', '/10.250.19.102', '50010']
@@ -104,6 +108,64 @@ class TestLogParser(unittest.TestCase):
 
         new_template = self.parser.getTemplate(lcs, seq)
         self.assertListEqual(new_template, expected_template)
+
+    def test_lcs_candidate_filtering_reduces_calls_without_changing_match(self):
+        parser = LogParser(tau=0.5)
+        seq = ['alpha', 'beta', 'shared1', 'shared2', 'shared3', 'shared4']
+        best = LCSObject(logTemplate=seq.copy(), logIDL=[1])
+        distractors = [
+            LCSObject(
+                logTemplate=['alpha', 'beta', 'shared1', 'shared2', '<*>', 'shared3', 'shared4', '<*>'],
+                logIDL=[i + 2],
+            )
+            for i in range(24)
+        ]
+        logCluL = [best] + distractors
+        parser._rebuild_match_indexes(logCluL)
+
+        call_count = {'count': 0}
+        original_lcs = parser.LCS
+
+        def counting_lcs(seq1, seq2):
+            call_count['count'] += 1
+            return original_lcs(seq1, seq2)
+
+        with patch.object(parser, 'LCS', side_effect=counting_lcs):
+            match = parser.LCSMatch(logCluL, seq, seq_token_set=set(seq))
+
+        self.assertIs(match, best)
+        self.assertLess(call_count['count'], len(logCluL))
+        self.assertEqual(call_count['count'], 1)
+
+    def test_lcs_guardrail_limits_comparisons_and_records_skips(self):
+        parser = LogParser(tau=0.5, max_lcs_comparisons_per_line=1)
+        seq = ['alpha', 'beta', 'shared1', 'shared2', 'shared3', 'shared4']
+        best = LCSObject(logTemplate=seq.copy(), logIDL=[1])
+        distractors = [
+            LCSObject(
+                logTemplate=['alpha', 'beta', 'shared1', 'shared2', '<*>', 'shared3', 'shared4', '<*>'],
+                logIDL=[i + 2],
+            )
+            for i in range(10)
+        ]
+        logCluL = [best] + distractors
+        parser._rebuild_match_indexes(logCluL)
+
+        metrics = {'total_lcs_comparisons': 0, 'guardrail_skips': 0}
+        call_count = {'count': 0}
+        original_lcs = parser.LCS
+
+        def counting_lcs(seq1, seq2):
+            call_count['count'] += 1
+            return original_lcs(seq1, seq2)
+
+        with patch.object(parser, 'LCS', side_effect=counting_lcs):
+            match = parser.LCSMatch(logCluL, seq, seq_token_set=set(seq), metrics=metrics)
+
+        self.assertIs(match, best)
+        self.assertEqual(call_count['count'], 1)
+        self.assertEqual(metrics['total_lcs_comparisons'], 1)
+        self.assertGreater(metrics['guardrail_skips'], 0)
 
 
 def helper(rootNode):
