@@ -1,6 +1,7 @@
 import unittest
 import re
 import os
+import tempfile
 import pandas as pd
 from pandas.testing import assert_frame_equal
 from spellpy.spell import LogParser, LCSObject, Node
@@ -47,12 +48,22 @@ class TestLogParser(unittest.TestCase):
         )
         assert_frame_equal(df_log, DF_MOCK)
 
-    def test_load_data(self):
-        self.parser.logformat = LOG_FORMAT
-        self.parser.path = THIS_DIR
-        self.parser.logname = 'test_data.log'
-        self.parser.load_data()
-        assert_frame_equal(self.parser.df_log, DF_MOCK)
+    def test_parse_streaming_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.parser = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+            )
+            self.parser.parse('test_data.log')
+
+            structured_path = os.path.join(self.parser.savePath, 'test_data.log_structured.csv')
+            df_structured = pd.read_csv(structured_path)
+
+            self.assertEqual(len(df_structured), 3)
+            self.assertEqual(df_structured['EventTemplate'].nunique(), 2)
+            self.assertListEqual(df_structured['LineId'].tolist(), [1, 2, 3])
 
     def test_addSeqToPrefixTree(self):
         logmessageL = ['Receiving', 'block', 'blk_-1608999687919862906', 'src', '/10.250.19.102', '54106', 'dest', '/10.250.19.102', '50010']

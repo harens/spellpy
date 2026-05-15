@@ -61,7 +61,6 @@ class LogParser(pickle.Unpickler):
         self.savePath = outdir
         self.tau = tau
         self.logformat = log_format
-        self.df_log = None
         self.keep_para = keep_para
         self.lastestLineId = 0
         self.text_max_length = text_max_length
@@ -306,45 +305,6 @@ class LogParser(pickle.Unpickler):
 
         logging.info('Parsing done. [Time taken: {!s}]'.format(datetime.now() - starttime))
 
-    def outputResult(self, logClustL):
-        if self.df_log.shape[0] == 0:
-            return
-
-        templates = [0] * self.df_log.shape[0]
-        ids = [0] * self.df_log.shape[0]
-        df_event = []
-
-        for logclust in logClustL:
-            template_str = ' '.join(logclust.logTemplate)
-            eid = hashlib.md5(template_str.encode('utf-8')).hexdigest()[0:8]
-            for logid in logclust.logIDL:
-                if logid <= self.lastestLineId:
-                    continue
-                templates[logid - self.lastestLineId - 1] = template_str
-                ids[logid - self.lastestLineId - 1] = eid
-            df_event.append([eid, template_str, len(logclust.logIDL)])
-
-        df_event = pd.DataFrame(df_event, columns=['EventId', 'EventTemplate', 'Occurrences'])
-
-        self.df_log['EventId'] = ids
-        self.df_log['EventTemplate'] = templates
-        if self.keep_para:
-            self.df_log["ParameterList"] = self.df_log.apply(self.get_parameter_list, axis=1)
-        logging.info('Output parse file')
-        self.df_log.to_csv(os.path.join(self.savePath, self.logname + '_structured.csv'), index=False)
-        df_event.to_csv(os.path.join(self.savePath, self.logname + '_templates.csv'), index=False)
-
-        # output Main file
-        if self.logmain:
-            if not os.path.exists(os.path.join(self.savePath, self.logmain + '_main_structured.csv')):
-                logging.info('Output main file for append')
-                self.df_log.to_csv(os.path.join(self.savePath, self.logmain + '_main_structured.csv'), index=False)
-                df_event.to_csv(os.path.join(self.savePath, self.logmain + '_main_templates.csv'), index=False)
-
-    def load_data(self):
-        headers, regex = self.generate_logformat_regex(self.logformat)
-        self.df_log = self.log_to_dataframe(os.path.join(self.path, self.logname), regex, headers, self.logformat)
-
     def log_to_dataframe(self, log_file, regex, headers, logformat):
         """ Function to transform log file to dataframe
         """
@@ -437,38 +397,6 @@ class LogParser(pickle.Unpickler):
     def _log_to_dataframe_handler(self, signum, frame):
         logging.error('log_to_dataframe function is hangs')
         raise Exception("TIME OUT!")
-
-    def appendResult(self, logClustL):
-        if self.df_log is None or self.df_log.shape[0] == 0:
-            return
-        if self.logmain is None:
-            return
-
-        main_structured_path = os.path.join(self.savePath, self.logmain + '_main_structured.csv')
-        main_exists = os.path.exists(main_structured_path)
-        if main_exists:
-            df_log_main_structured = pd.read_csv(main_structured_path, usecols=['LineId'])
-            lastestLineId = df_log_main_structured['LineId'].max()
-            logging.info(f'lastestLineId: {lastestLineId}')
-        else:
-            lastestLineId = 0
-
-        line_to_event, df_event = self._build_event_lookup(logClustL)
-        df_new = self.df_log[self.df_log['LineId'] > lastestLineId].copy()
-        df_new['EventId'] = df_new['LineId'].map(lambda line_id: line_to_event.get(line_id, (0, 0))[0])
-        df_new['EventTemplate'] = df_new['LineId'].map(lambda line_id: line_to_event.get(line_id, (0, 0))[1])
-        if self.keep_para:
-            df_new['ParameterList'] = df_new.apply(self.get_parameter_list, axis=1)
-
-        df_new = df_new[df_new['EventId'] != 0]
-        if not df_new.empty:
-            df_new.to_csv(
-                main_structured_path,
-                index=False,
-                mode='a' if main_exists else 'w',
-                header=not main_exists,
-            )
-        df_event.to_csv(os.path.join(self.savePath, self.logmain + '_main_templates.csv'), index=False)
 
     def _build_event_lookup(self, logClustL):
         line_to_event = {}
