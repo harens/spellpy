@@ -68,6 +68,8 @@ class TestLogParser(unittest.TestCase):
             self.assertEqual(self.parser.parse_metrics['input_lines_processed'], 3)
             self.assertEqual(self.parser.parse_metrics['templates_created'], 2)
             self.assertGreaterEqual(self.parser.parse_metrics['candidate_templates_mean'], 0.0)
+            self.assertIn('duplicate_membership_checks', self.parser.parse_metrics)
+            self.assertIn('line_elapsed_max_seconds', self.parser.parse_metrics)
 
     def test_addSeqToPrefixTree(self):
         logmessageL = ['Receiving', 'block', 'blk_-1608999687919862906', 'src', '/10.250.19.102', '54106', 'dest', '/10.250.19.102', '50010']
@@ -108,6 +110,20 @@ class TestLogParser(unittest.TestCase):
 
         new_template = self.parser.getTemplate(lcs, seq)
         self.assertListEqual(new_template, expected_template)
+
+    def test_record_cluster_log_id_uses_constant_time_membership(self):
+        class RaisingList(list):
+            def __contains__(self, item):
+                raise AssertionError('list membership should not be used')
+
+        cluster = LCSObject(logTemplate=['alpha', 'beta'], logIDL=[1, 2])
+        cluster.logIDL = RaisingList(cluster.logIDL)
+        cluster.logIDSet = {1, 2}
+
+        self.assertFalse(self.parser._record_cluster_log_id(cluster, 2))
+        self.assertTrue(self.parser._record_cluster_log_id(cluster, 3))
+        self.assertListEqual(list(cluster.logIDL), [1, 2, 3])
+        self.assertSetEqual(cluster.logIDSet, {1, 2, 3})
 
     def test_lcs_candidate_filtering_reduces_calls_without_changing_match(self):
         parser = LogParser(tau=0.5)
@@ -166,6 +182,49 @@ class TestLogParser(unittest.TestCase):
         self.assertEqual(call_count['count'], 1)
         self.assertEqual(metrics['total_lcs_comparisons'], 1)
         self.assertGreater(metrics['guardrail_skips'], 0)
+
+    def test_parse_does_not_reuse_disk_state_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+            )
+            first.parse('test_data.log')
+            first_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
+            self.assertListEqual(first_df['LineId'].tolist(), [1, 2, 3])
+
+            second = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+            )
+            second.parse('test_data.log')
+            second_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
+            self.assertListEqual(second_df['LineId'].tolist(), [1, 2, 3])
+
+    def test_parse_can_resume_state_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+            )
+            first.parse('test_data.log')
+
+            resumed = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+                resume_state=True,
+            )
+            resumed.parse('test_data.log')
+            resumed_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
+            self.assertListEqual(resumed_df['LineId'].tolist(), [4, 5, 6])
 
 
 def helper(rootNode):
