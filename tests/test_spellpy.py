@@ -281,6 +281,37 @@ class TestLogParser(unittest.TestCase):
             self.assertAlmostEqual(elapsed[0], elapsed[1], delta=max(0.05, elapsed[0] * 2))
             self.assertAlmostEqual(elapsed[1], elapsed[2], delta=max(0.05, elapsed[1] * 2))
 
+    def test_progress_interval_zero_disables_progress_logging(self):
+        log_lines = []
+        for i in range(100):
+            log_lines.append(
+                f'081109 203518 143 INFO dfs.DataNode$DataXceiver: '
+                f'Receiving block blk_-1608999687919862906 seq {i} src: /10.250.19.102:54106 '
+                f'dest: /10.250.19.102:50010'
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, 'quiet.log')
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(log_lines))
+
+            parser = LogParser(
+                indir=tmpdir,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+                progress_interval=0,
+                slow_line_threshold=999.0,
+            )
+
+            with self.assertLogs('spellpy.spell', level='INFO') as captured:
+                parser.parse('quiet.log')
+
+            progress_logs = [line for line in captured.output if 'Processed ' in line]
+            self.assertEqual(progress_logs, [])
+            self.assertLessEqual(len(captured.output), 3)
+            self.assertEqual(parser.parse_metrics['input_lines_processed'], 100)
+
 
 def helper(rootNode):
     if rootNode.childD == dict():

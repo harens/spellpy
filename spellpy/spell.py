@@ -89,7 +89,7 @@ class LogParser(pickle.Unpickler):
         self.lastestLineId = 0
         self.text_max_length = text_max_length
         self.date_filter = date_filter
-        self.progress_interval = max(1, progress_interval)
+        self.progress_interval = max(0, progress_interval)
         self.max_lcs_comparisons_per_line = max_lcs_comparisons_per_line
         self.resume_state = resume_state
         self.slow_line_threshold = slow_line_threshold
@@ -637,7 +637,7 @@ class LogParser(pickle.Unpickler):
                             metrics['max_cluster_history_size'],
                             getattr(matchCluster, 'occurrence_count', 0),
                         )
-                        if count % self.progress_interval == 0 or count == total_line:
+                        if self.progress_interval and (count % self.progress_interval == 0 or count == total_line):
                             structured_file.flush()
                             if main_file is not None:
                                 main_file.flush()
