@@ -21,6 +21,7 @@ sys.setrecursionlimit(10000)
 
 NON_ASCII_RE = re.compile(r'[^\x00-\x7F]+')
 TOKEN_SPLIT_RE = re.compile(r'[\s=:,]')
+DEFAULT_PROGRESS_INTERVAL = 50000
 
 
 class LCSObject:
@@ -30,6 +31,7 @@ class LCSObject:
         self.logTemplate = logTemplate
         self.logIDL = [] if logIDL is None else list(logIDL)
         self.logIDSet = set(self.logIDL)
+        self.occurrence_count = len(self.logIDL)
 
 
 class Node:
@@ -71,10 +73,11 @@ class LogParser(pickle.Unpickler):
         text_max_length=4096,
         logmain=None,
         date_filter='',
-        progress_interval=10000,
+        progress_interval=DEFAULT_PROGRESS_INTERVAL,
         max_lcs_comparisons_per_line=None,
         resume_state=False,
         slow_line_threshold=1.0,
+        persist_state=False,
     ):
         self.path = indir
         self.logname = None
@@ -90,6 +93,7 @@ class LogParser(pickle.Unpickler):
         self.max_lcs_comparisons_per_line = max_lcs_comparisons_per_line
         self.resume_state = resume_state
         self.slow_line_threshold = slow_line_threshold
+        self.persist_state = persist_state
         self.parse_metrics = {}
         self.rootNode = Node()
         self.logCluL = []
@@ -99,6 +103,8 @@ class LogParser(pickle.Unpickler):
         self._cluster_meta = {}
         self._cluster_order = {}
         self._next_cluster_order = 0
+        self._cluster_index = {}
+        self._next_cluster_index = 0
 
     def _normalize_cluster_history(self, cluster):
         logidl = getattr(cluster, 'logIDL', None)
@@ -115,6 +121,11 @@ class LogParser(pickle.Unpickler):
         else:
             cluster.logIDSet = set(logid_set)
             cluster.logIDSet.update(cluster.logIDL)
+        cluster.occurrence_count = max(
+            getattr(cluster, 'occurrence_count', 0),
+            len(cluster.logIDL),
+            len(cluster.logIDSet),
+        )
         return cluster
 
     def _cluster_has_log_id(self, cluster, log_id):
@@ -127,7 +138,42 @@ class LogParser(pickle.Unpickler):
             return False
         cluster.logIDSet.add(log_id)
         cluster.logIDL.append(log_id)
+        cluster.occurrence_count = max(getattr(cluster, 'occurrence_count', 0), len(cluster.logIDL))
         return True
+
+    def _record_cluster_occurrence(self, cluster):
+        cluster.occurrence_count = getattr(cluster, 'occurrence_count', len(cluster.logIDL)) + 1
+        return cluster.occurrence_count
+
+    def _event_row_for_cluster(self, cluster):
+        template_str = ' '.join(cluster.logTemplate)
+        eid = hashlib.md5(template_str.encode('utf-8')).hexdigest()[0:8]
+        return eid, template_str, getattr(cluster, 'occurrence_count', len(cluster.logIDL))
+
+    def _write_template_summary(self, output_path, logCluL):
+        with open(output_path, 'w', newline='') as output:
+            writer = csv.writer(output)
+            writer.writerow(['EventId', 'EventTemplate', 'Occurrences'])
+            for cluster in logCluL:
+                eid, template_str, occurrences = self._event_row_for_cluster(cluster)
+                writer.writerow([eid, template_str, occurrences])
+
+    def _finalize_structured_csv(self, source_path, output_path, row_cluster_indices, logCluL, append=False):
+        first_chunk = not append or not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+        with open(source_path, 'r', newline='') as source, open(output_path, 'a' if append else 'w', newline='') as output:
+            reader = csv.DictReader(source)
+            fieldnames = reader.fieldnames or []
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            if first_chunk:
+                writer.writeheader()
+            for row, cluster_index in zip(reader, row_cluster_indices):
+                cluster = logCluL[cluster_index]
+                event_id, event_template, _ = self._event_row_for_cluster(cluster)
+                row['EventId'] = event_id
+                row['EventTemplate'] = event_template
+                if self.keep_para:
+                    row['ParameterList'] = self.get_parameter_list({'EventTemplate': event_template, 'Content': row['Content']})
+                writer.writerow(row)
 
     def _template_stats(self, template):
         const_tokens = [token for token in template if token != '<*>']
@@ -145,6 +191,9 @@ class LogParser(pickle.Unpickler):
         if cluster not in self._cluster_order:
             self._cluster_order[cluster] = self._next_cluster_order
             self._next_cluster_order += 1
+        if cluster not in self._cluster_index:
+            self._cluster_index[cluster] = self._next_cluster_index
+            self._next_cluster_index += 1
 
         if stats['const_count'] == 0:
             self._wildcard_clusters.add(cluster)
@@ -175,6 +224,8 @@ class LogParser(pickle.Unpickler):
         self._token_to_clusters = defaultdict(set)
         self._wildcard_clusters = set()
         self._cluster_meta = {}
+        self._cluster_index = {}
+        self._next_cluster_index = 0
         for cluster in logCluL:
             self._normalize_cluster_history(cluster)
             self._register_cluster(cluster)
@@ -393,6 +444,7 @@ class LogParser(pickle.Unpickler):
 
         rootNodePath = os.path.join(self.savePath, 'rootNode.pkl')
         logCluLPath = os.path.join(self.savePath, 'logCluL.pkl')
+        stateMetaPath = os.path.join(self.savePath, 'state_meta.pkl')
 
         if not self._state_initialized:
             if self.resume_state and os.path.exists(rootNodePath) and os.path.exists(logCluLPath):
@@ -402,10 +454,15 @@ class LogParser(pickle.Unpickler):
                     self.logCluL = CustomUnpickler(f).load()
                 for logclust in self.logCluL:
                     self._normalize_cluster_history(logclust)
-                self.lastestLineId = max(
-                    (max(logclust.logIDSet) for logclust in self.logCluL if getattr(logclust, 'logIDSet', None)),
-                    default=0,
-                )
+                if os.path.exists(stateMetaPath):
+                    with open(stateMetaPath, 'rb') as f:
+                        state_meta = pickle.load(f)
+                    self.lastestLineId = int(state_meta.get('lastestLineId', 0))
+                else:
+                    self.lastestLineId = max(
+                        (max(logclust.logIDSet) for logclust in self.logCluL if getattr(logclust, 'logIDSet', None)),
+                        default=0,
+                    )
                 logger.info(f'Load objects done, lastestLineId: {self.lastestLineId}')
             else:
                 self.rootNode = Node()
@@ -424,7 +481,6 @@ class LogParser(pickle.Unpickler):
         log_file = os.path.join(self.path, self.logname)
         headers, regex = self.generate_logformat_regex(self.logformat)
         content_idx = headers.index('Content')
-        cache_path = os.path.join(self.savePath, f'.{self.logname}.raw.csv')
         total_line = self._count_lines(log_file)
 
         count = 0
@@ -441,149 +497,201 @@ class LogParser(pickle.Unpickler):
             'line_elapsed_total_seconds': 0.0,
             'line_elapsed_max_seconds': 0.0,
             'slow_lines': 0,
-            'max_cluster_history_size': max((len(cluster.logIDL) for cluster in logCluL), default=0),
+            'max_cluster_history_size': max(
+                (getattr(cluster, 'occurrence_count', len(cluster.logIDL)) for cluster in logCluL),
+                default=0,
+            ),
             'max_cluster_history_set_size': max((len(cluster.logIDSet) for cluster in logCluL), default=0),
         }
-        with open(cache_path, 'w', newline='') as cache_file:
-            writer = csv.writer(cache_file)
-            writer.writerow(['LineId'] + headers)
 
-            with open(log_file, 'r') as fin:
-                for raw_line in fin:
-                    metrics['raw_lines_seen'] += 1
-                    if len(raw_line) > self.text_max_length:
-                        logger.error('Length of log string is too long')
-                        logger.error(raw_line)
-                        continue
-                    if self.date_filter not in raw_line:
-                        continue
+        output_path = os.path.join(self.savePath, self.logname + '_structured.csv')
+        temp_output_path = output_path + '.tmp'
+        main_output_path = None
+        temp_main_output_path = None
+        if self.logmain:
+            main_output_path = os.path.join(self.savePath, self.logmain + '_main_structured.csv')
+            temp_main_output_path = main_output_path + '.tmp'
 
-                    signal.signal(signal.SIGALRM, self._log_to_dataframe_handler)
-                    signal.alarm(1)
-                    try:
-                        line = NON_ASCII_RE.sub('<NASCII>', raw_line)
-                        match = regex.search(line.strip())
-                        if match is None:
+        output_headers = ['LineId'] + headers + ['EventId', 'EventTemplate']
+        if self.keep_para:
+            output_headers.append('ParameterList')
+
+        row_cluster_indices = []
+        with open(temp_output_path, 'w', newline='') as structured_file:
+            structured_writer = csv.writer(structured_file)
+            structured_writer.writerow(output_headers)
+
+            main_writer = None
+            main_file = None
+            if temp_main_output_path:
+                main_file = open(temp_main_output_path, 'w', newline='')
+                main_writer = csv.writer(main_file)
+                main_writer.writerow(output_headers)
+
+            try:
+                with open(log_file, 'r') as fin:
+                    for raw_line in fin:
+                        metrics['raw_lines_seen'] += 1
+                        if len(raw_line) > self.text_max_length:
+                            logger.error('Length of log string is too long')
+                            logger.error(raw_line)
                             continue
-                        message = [match.group(header) for header in headers]
-                    except Exception as e:
-                        _ = e
-                        continue
-                    finally:
-                        signal.alarm(0)
+                        if self.date_filter not in raw_line:
+                            continue
 
-                    logID = self.lastestLineId + count + 1
-                    writer.writerow([logID] + message)
-                    line_start = time.perf_counter()
-                    logmessageL = self._tokenize_content(message[content_idx])
-                    constLogMessL = [w for w in logmessageL if w != '<*>']
-                    seq_token_set = set(constLogMessL)
-                    candidate_clusters = self._candidate_clusters(logCluL, constLogMessL, seq_token_set, for_lcs=False)
-                    metrics['candidate_templates_sum'] += len(candidate_clusters)
-                    metrics['candidate_templates_max'] = max(metrics['candidate_templates_max'], len(candidate_clusters))
+                        signal.signal(signal.SIGALRM, self._log_to_dataframe_handler)
+                        signal.alarm(1)
+                        try:
+                            line = NON_ASCII_RE.sub('<NASCII>', raw_line)
+                            match = regex.search(line.strip())
+                            if match is None:
+                                continue
+                            message = [match.group(header) for header in headers]
+                        except Exception as e:
+                            _ = e
+                            continue
+                        finally:
+                            signal.alarm(0)
 
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            'Matching line %s: clusters=%s candidates=%s',
-                            logID,
-                            len(logCluL),
-                            len(candidate_clusters),
-                        )
+                        logID = self.lastestLineId + count + 1
+                        line_start = time.perf_counter()
+                        logmessageL = self._tokenize_content(message[content_idx])
+                        constLogMessL = [w for w in logmessageL if w != '<*>']
+                        seq_token_set = set(constLogMessL)
+                        candidate_clusters = self._candidate_clusters(logCluL, constLogMessL, seq_token_set, for_lcs=False)
+                        metrics['candidate_templates_sum'] += len(candidate_clusters)
+                        metrics['candidate_templates_max'] = max(metrics['candidate_templates_max'], len(candidate_clusters))
 
-                    # Find an existing matched log cluster
-                    matchCluster = self.PrefixTreeMatch(rootNode, constLogMessL, 0)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                'Matching line %s: clusters=%s candidates=%s',
+                                logID,
+                                len(logCluL),
+                                len(candidate_clusters),
+                            )
 
-                    if matchCluster is None:
-                        matchCluster = self.SimpleLoopMatch(candidate_clusters, constLogMessL, seq_token_set=seq_token_set)
+                        matchCluster = self.PrefixTreeMatch(rootNode, constLogMessL, 0)
 
                         if matchCluster is None:
-                            matchCluster = self.LCSMatch(logCluL, logmessageL, seq_token_set=seq_token_set, metrics=metrics)
+                            matchCluster = self.SimpleLoopMatch(candidate_clusters, constLogMessL, seq_token_set=seq_token_set)
 
-                            # Match no existing log cluster
                             if matchCluster is None:
-                                newCluster = LCSObject(logTemplate=logmessageL, logIDL=[logID])
-                                logCluL.append(newCluster)
-                                self._register_cluster(newCluster)
-                                metrics['templates_created'] += 1
-                                self.addSeqToPrefixTree(rootNode, newCluster)
-                            # Add the new log message to the existing cluster
-                            else:
-                                newTemplate = self.getTemplate(self.LCS(logmessageL, matchCluster.logTemplate),
-                                                               matchCluster.logTemplate)
-                                if ' '.join(newTemplate) != ' '.join(matchCluster.logTemplate):
-                                    self.removeSeqFromPrefixTree(rootNode, matchCluster)
-                                    self._unregister_cluster(matchCluster)
-                                    matchCluster.logTemplate = newTemplate
+                                matchCluster = self.LCSMatch(logCluL, logmessageL, seq_token_set=seq_token_set, metrics=metrics)
+
+                                if matchCluster is None:
+                                    matchCluster = LCSObject(logTemplate=logmessageL, logIDL=[])
+                                    matchCluster.occurrence_count = 0
+                                    logCluL.append(matchCluster)
                                     self._register_cluster(matchCluster)
+                                    metrics['templates_created'] += 1
                                     self.addSeqToPrefixTree(rootNode, matchCluster)
-                    if matchCluster is not None:
-                        metrics['duplicate_membership_checks'] += 1
-                        if self._record_cluster_log_id(matchCluster, logID):
-                            metrics['max_cluster_history_size'] = max(
+                                else:
+                                    newTemplate = self.getTemplate(self.LCS(logmessageL, matchCluster.logTemplate),
+                                                                   matchCluster.logTemplate)
+                                    if ' '.join(newTemplate) != ' '.join(matchCluster.logTemplate):
+                                        self.removeSeqFromPrefixTree(rootNode, matchCluster)
+                                        self._unregister_cluster(matchCluster)
+                                        matchCluster.logTemplate = newTemplate
+                                        self._register_cluster(matchCluster)
+                                        self.addSeqToPrefixTree(rootNode, matchCluster)
+
+                        if matchCluster is not None:
+                            self._record_cluster_occurrence(matchCluster)
+
+                        cluster_index = self._cluster_index.get(matchCluster)
+                        if cluster_index is None:
+                            try:
+                                cluster_index = logCluL.index(matchCluster)
+                            except ValueError:
+                                logCluL.append(matchCluster)
+                                cluster_index = len(logCluL) - 1
+                            self._cluster_index[matchCluster] = cluster_index
+                            self._next_cluster_index = max(self._next_cluster_index, cluster_index + 1)
+                        row_cluster_indices.append(cluster_index)
+                        placeholder_row = [logID] + message + ['0', '']
+                        if self.keep_para:
+                            placeholder_row.append([])
+                        structured_writer.writerow(placeholder_row)
+                        if main_writer is not None:
+                            main_writer.writerow(placeholder_row)
+
+                        line_elapsed = time.perf_counter() - line_start
+                        metrics['line_elapsed_total_seconds'] += line_elapsed
+                        metrics['line_elapsed_max_seconds'] = max(metrics['line_elapsed_max_seconds'], line_elapsed)
+                        if self.slow_line_threshold is not None and line_elapsed >= self.slow_line_threshold:
+                            metrics['slow_lines'] += 1
+                            logger.warning(
+                                'Slow line %s took %.3fs; clusters=%s candidates=%s lcs=%s duplicate_checks=%s history_size=%s',
+                                logID,
+                                line_elapsed,
+                                len(logCluL),
+                                len(candidate_clusters),
+                                metrics['total_lcs_comparisons'],
+                                metrics['duplicate_membership_checks'],
                                 metrics['max_cluster_history_size'],
-                                len(matchCluster.logIDL),
                             )
-                            metrics['max_cluster_history_set_size'] = max(
-                                metrics['max_cluster_history_set_size'],
-                                len(matchCluster.logIDSet),
-                            )
-                        else:
-                            metrics['duplicate_membership_hits'] += 1
 
-                    line_elapsed = time.perf_counter() - line_start
-                    metrics['line_elapsed_total_seconds'] += line_elapsed
-                    metrics['line_elapsed_max_seconds'] = max(metrics['line_elapsed_max_seconds'], line_elapsed)
-                    if self.slow_line_threshold is not None and line_elapsed >= self.slow_line_threshold:
-                        metrics['slow_lines'] += 1
-                        logger.warning(
-                            'Slow line %s took %.3fs; clusters=%s candidates=%s lcs=%s duplicate_checks=%s history_size=%s',
-                            logID,
-                            line_elapsed,
-                            len(logCluL),
-                            len(candidate_clusters),
-                            metrics['total_lcs_comparisons'],
-                            metrics['duplicate_membership_checks'],
+                        count += 1
+                        metrics['input_lines_processed'] += 1
+                        metrics['max_cluster_history_size'] = max(
                             metrics['max_cluster_history_size'],
+                            getattr(matchCluster, 'occurrence_count', 0),
                         )
+                        if count % self.progress_interval == 0 or count == total_line:
+                            structured_file.flush()
+                            if main_file is not None:
+                                main_file.flush()
+                            mean_candidates = (
+                                metrics['candidate_templates_sum'] / metrics['input_lines_processed']
+                                if metrics['input_lines_processed'] else 0.0
+                            )
+                            percentage = count * 100.0 / total_line if total_line else 100.0
+                            logger.info(
+                                'Processed %.1f%% of log lines. lines=%s templates=%s lcs=%s candidates_mean=%.2f candidates_max=%s guardrail_skips=%s duplicate_checks=%s',
+                                percentage,
+                                metrics['input_lines_processed'],
+                                len(logCluL),
+                                metrics['total_lcs_comparisons'],
+                                mean_candidates,
+                                metrics['candidate_templates_max'],
+                                metrics['guardrail_skips'],
+                                metrics['duplicate_membership_checks'],
+                            )
+            finally:
+                if main_file is not None:
+                    main_file.close()
 
-                    count += 1
-                    metrics['input_lines_processed'] += 1
-                    if count % self.progress_interval == 0 or count == total_line:
-                        cache_file.flush()
-                        mean_candidates = (
-                            metrics['candidate_templates_sum'] / metrics['input_lines_processed']
-                            if metrics['input_lines_processed'] else 0.0
-                        )
-                        percentage = count * 100.0 / total_line if total_line else 100.0
-                        logger.info(
-                            'Processed %.1f%% of log lines. lines=%s templates=%s lcs=%s candidates_mean=%.2f candidates_max=%s guardrail_skips=%s duplicate_checks=%s',
-                            percentage,
-                            metrics['input_lines_processed'],
-                            len(logCluL),
-                            metrics['total_lcs_comparisons'],
-                            mean_candidates,
-                            metrics['candidate_templates_max'],
-                            metrics['guardrail_skips'],
-                            metrics['duplicate_membership_checks'],
-                        )
-
-        self._write_outputs(cache_path, logCluL)
-
-        if self.logmain:
-            self._append_main_output(cache_path, logCluL)
-
+        self._finalize_structured_csv(temp_output_path, output_path, row_cluster_indices, logCluL, append=False)
         try:
-            os.remove(cache_path)
+            os.remove(temp_output_path)
         except OSError:
             pass
 
-        logger.info(f'rootNodePath: {rootNodePath}')
-        with open(rootNodePath, 'wb') as output:
-            pickle.dump(rootNode, output, pickle.HIGHEST_PROTOCOL)
-        logger.info(f'logCluLPath: {logCluLPath}')
-        with open(logCluLPath, 'wb') as output:
-            pickle.dump(logCluL, output, pickle.HIGHEST_PROTOCOL)
-        logger.info('Store objects done.')
+        if temp_main_output_path is not None:
+            self._finalize_structured_csv(temp_main_output_path, main_output_path, row_cluster_indices, logCluL, append=True)
+            try:
+                os.remove(temp_main_output_path)
+            except OSError:
+                pass
+
+        self.lastestLineId += metrics['input_lines_processed']
+
+        templates_path = os.path.join(self.savePath, self.logname + '_templates.csv')
+        self._write_template_summary(templates_path, logCluL)
+        if self.logmain:
+            main_templates_path = os.path.join(self.savePath, self.logmain + '_main_templates.csv')
+            self._write_template_summary(main_templates_path, logCluL)
+
+        if self.persist_state:
+            logger.info(f'rootNodePath: {rootNodePath}')
+            with open(rootNodePath, 'wb') as output:
+                pickle.dump(rootNode, output, pickle.HIGHEST_PROTOCOL)
+            logger.info(f'logCluLPath: {logCluLPath}')
+            with open(logCluLPath, 'wb') as output:
+                pickle.dump(logCluL, output, pickle.HIGHEST_PROTOCOL)
+            with open(stateMetaPath, 'wb') as output:
+                pickle.dump({'lastestLineId': self.lastestLineId}, output, pickle.HIGHEST_PROTOCOL)
+            logger.info('Store objects done.')
 
         elapsed = (datetime.now() - starttime).total_seconds()
         mean_candidates = (
@@ -627,7 +735,7 @@ class LogParser(pickle.Unpickler):
                     message = [match.group(header) for header in headers]
                     log_messages.append(message)
                     linecount += 1
-                    if linecount % 10000 == 0 or linecount == total_line:
+                    if linecount % DEFAULT_PROGRESS_INTERVAL == 0 or linecount == total_line:
                         logger.info('Loaded {0:.1f}% of log lines.'.format(linecount*100/total_line))
                 except Exception as e:
                     _ = e
@@ -695,47 +803,3 @@ class LogParser(pickle.Unpickler):
     def _log_to_dataframe_handler(self, signum, frame):
         logger.error('log_to_dataframe function is hangs')
         raise Exception("TIME OUT!")
-
-    def _build_event_lookup(self, logClustL):
-        line_to_event = {}
-        df_event = []
-
-        for logclust in logClustL:
-            template_str = ' '.join(logclust.logTemplate)
-            eid = hashlib.md5(template_str.encode('utf-8')).hexdigest()[0:8]
-            for logid in logclust.logIDL:
-                if logid <= self.lastestLineId:
-                    continue
-                line_to_event[logid] = (eid, template_str)
-            df_event.append([eid, template_str, len(logclust.logIDL)])
-
-        return line_to_event, pd.DataFrame(df_event, columns=['EventId', 'EventTemplate', 'Occurrences'])
-
-    def _write_outputs(self, cache_path, logClustL):
-        if self._count_lines(cache_path) == 0:
-            return
-
-        line_to_event, df_event = self._build_event_lookup(logClustL)
-        structured_path = os.path.join(self.savePath, self.logname + '_structured.csv')
-        self._write_structured_csv(cache_path, structured_path, line_to_event, append=False)
-        df_event.to_csv(os.path.join(self.savePath, self.logname + '_templates.csv'), index=False)
-
-    def _append_main_output(self, cache_path, logClustL):
-        if self.logmain is None or self._count_lines(cache_path) == 0:
-            return
-
-        line_to_event, df_event = self._build_event_lookup(logClustL)
-        main_structured_path = os.path.join(self.savePath, self.logmain + '_main_structured.csv')
-        self._write_structured_csv(cache_path, main_structured_path, line_to_event, append=True)
-        df_event.to_csv(os.path.join(self.savePath, self.logmain + '_main_templates.csv'), index=False)
-
-    def _write_structured_csv(self, cache_path, output_path, line_to_event, append=False):
-        first_chunk = not append or not os.path.exists(output_path)
-        for chunk in pd.read_csv(cache_path, chunksize=10000):
-            event_info = chunk['LineId'].map(line_to_event)
-            chunk['EventId'] = event_info.apply(lambda x: x[0] if isinstance(x, tuple) else 0)
-            chunk['EventTemplate'] = event_info.apply(lambda x: x[1] if isinstance(x, tuple) else 0)
-            if self.keep_para:
-                chunk['ParameterList'] = chunk.apply(self.get_parameter_list, axis=1)
-            chunk.to_csv(output_path, index=False, mode='a' if not first_chunk else 'w', header=first_chunk)
-            first_chunk = False

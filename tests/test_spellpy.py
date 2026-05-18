@@ -60,16 +60,48 @@ class TestLogParser(unittest.TestCase):
             self.parser.parse('test_data.log')
 
             structured_path = os.path.join(self.parser.savePath, 'test_data.log_structured.csv')
+            templates_path = os.path.join(self.parser.savePath, 'test_data.log_templates.csv')
+            raw_cache_path = os.path.join(self.parser.savePath, '.test_data.log.raw.csv')
             df_structured = pd.read_csv(structured_path)
+            df_templates = pd.read_csv(templates_path)
 
             self.assertEqual(len(df_structured), 3)
             self.assertEqual(df_structured['EventTemplate'].nunique(), 2)
             self.assertListEqual(df_structured['LineId'].tolist(), [1, 2, 3])
+            self.assertEqual(sorted(df_templates['Occurrences'].tolist()), [1, 2])
+            self.assertEqual(df_templates['Occurrences'].sum(), 3)
+            self.assertFalse(os.path.exists(raw_cache_path))
             self.assertEqual(self.parser.parse_metrics['input_lines_processed'], 3)
             self.assertEqual(self.parser.parse_metrics['templates_created'], 2)
             self.assertGreaterEqual(self.parser.parse_metrics['candidate_templates_mean'], 0.0)
             self.assertIn('duplicate_membership_checks', self.parser.parse_metrics)
             self.assertIn('line_elapsed_max_seconds', self.parser.parse_metrics)
+
+    def test_streaming_parse_does_not_scan_logidl_membership_in_hot_loop(self):
+        class RaisingList(list):
+            def __contains__(self, item):
+                raise AssertionError('logIDL membership should not be used in the hot loop')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parser = LogParser(
+                indir=THIS_DIR,
+                outdir=tmpdir,
+                log_format=LOG_FORMAT,
+                keep_para=False,
+            )
+            cluster = LCSObject(logTemplate=['Receiving', 'block', '<*>'], logIDL=[1])
+            cluster.logIDL = RaisingList(cluster.logIDL)
+            cluster.logIDSet = {1}
+            cluster.occurrence_count = 1
+            parser.rootNode = Node()
+            parser.logCluL = [cluster]
+            parser._state_initialized = True
+            parser.addSeqToPrefixTree(parser.rootNode, cluster)
+
+            parser.parse('test_data.log')
+
+            self.assertEqual(parser.parse_metrics['input_lines_processed'], 3)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, '.test_data.log.raw.csv')))
 
     def test_addSeqToPrefixTree(self):
         logmessageL = ['Receiving', 'block', 'blk_-1608999687919862906', 'src', '/10.250.19.102', '54106', 'dest', '/10.250.19.102', '50010']
@@ -194,6 +226,9 @@ class TestLogParser(unittest.TestCase):
             first.parse('test_data.log')
             first_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
             self.assertListEqual(first_df['LineId'].tolist(), [1, 2, 3])
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, '.test_data.log.raw.csv')))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, 'rootNode.pkl')))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, 'logCluL.pkl')))
 
             second = LogParser(
                 indir=THIS_DIR,
@@ -204,6 +239,7 @@ class TestLogParser(unittest.TestCase):
             second.parse('test_data.log')
             second_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
             self.assertListEqual(second_df['LineId'].tolist(), [1, 2, 3])
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, '.test_data.log.raw.csv')))
 
     def test_parse_can_resume_state_when_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -212,6 +248,7 @@ class TestLogParser(unittest.TestCase):
                 outdir=tmpdir,
                 log_format=LOG_FORMAT,
                 keep_para=False,
+                persist_state=True,
             )
             first.parse('test_data.log')
 
@@ -221,10 +258,28 @@ class TestLogParser(unittest.TestCase):
                 log_format=LOG_FORMAT,
                 keep_para=False,
                 resume_state=True,
+                persist_state=True,
             )
             resumed.parse('test_data.log')
             resumed_df = pd.read_csv(os.path.join(tmpdir, 'test_data.log_structured.csv'))
             self.assertListEqual(resumed_df['LineId'].tolist(), [4, 5, 6])
+
+    def test_repeated_fresh_parses_keep_runtime_stable_on_bounded_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            elapsed = []
+            for _ in range(3):
+                parser = LogParser(
+                    indir=THIS_DIR,
+                    outdir=tmpdir,
+                    log_format=LOG_FORMAT,
+                    keep_para=False,
+                )
+                parser.parse('test_data.log')
+                elapsed.append(parser.parse_metrics['elapsed_seconds'])
+
+            self.assertEqual(len(elapsed), 3)
+            self.assertAlmostEqual(elapsed[0], elapsed[1], delta=max(0.05, elapsed[0] * 2))
+            self.assertAlmostEqual(elapsed[1], elapsed[2], delta=max(0.05, elapsed[1] * 2))
 
 
 def helper(rootNode):
