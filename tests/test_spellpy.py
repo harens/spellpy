@@ -1,6 +1,7 @@
 import unittest
 import re
 import os
+import csv
 import tempfile
 import pandas as pd
 from unittest.mock import patch
@@ -76,6 +77,36 @@ class TestLogParser(unittest.TestCase):
             self.assertGreaterEqual(self.parser.parse_metrics['candidate_templates_mean'], 0.0)
             self.assertIn('duplicate_membership_checks', self.parser.parse_metrics)
             self.assertIn('line_elapsed_max_seconds', self.parser.parse_metrics)
+
+    def test_finalize_structured_csv_caches_cluster_metadata_once_per_cluster(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = os.path.join(tmpdir, 'source.csv')
+            output_path = os.path.join(tmpdir, 'output.csv')
+            with open(source_path, 'w', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['LineId', 'Content', 'EventId', 'EventTemplate'])
+                writer.writerow([1, 'alpha beta', '', ''])
+                writer.writerow([2, 'gamma delta', '', ''])
+                writer.writerow([3, 'alpha beta', '', ''])
+
+            clusters = [
+                LCSObject(logTemplate=['alpha', '<*>'], logIDL=[1]),
+                LCSObject(logTemplate=['gamma', 'delta'], logIDL=[2]),
+            ]
+
+            with patch.object(self.parser, '_event_row_for_cluster', wraps=self.parser._event_row_for_cluster) as event_row:
+                self.parser._finalize_structured_csv(
+                    source_path,
+                    output_path,
+                    [0, 1, 0],
+                    clusters,
+                    append=False,
+                )
+
+            self.assertEqual(event_row.call_count, len(clusters))
+            df = pd.read_csv(output_path)
+            self.assertListEqual(df['EventTemplate'].tolist(), ['alpha <*>', 'gamma delta', 'alpha <*>'])
+            self.assertEqual(df['EventId'].nunique(), 2)
 
     def test_streaming_parse_does_not_scan_logidl_membership_in_hot_loop(self):
         class RaisingList(list):

@@ -160,19 +160,30 @@ class LogParser(pickle.Unpickler):
 
     def _finalize_structured_csv(self, source_path, output_path, row_cluster_indices, logCluL, append=False):
         first_chunk = not append or not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+        # Cache cluster-level metadata once. The final structured CSV can contain many rows per
+        # cluster, so recomputing the event id and joined template for every row is pure overhead.
+        cluster_rows = [self._event_row_for_cluster(cluster) for cluster in logCluL]
         with open(source_path, 'r', newline='') as source, open(output_path, 'a' if append else 'w', newline='') as output:
-            reader = csv.DictReader(source)
-            fieldnames = reader.fieldnames or []
-            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            reader = csv.reader(source)
+            fieldnames = next(reader, [])
+            writer = csv.writer(output)
             if first_chunk:
-                writer.writeheader()
+                writer.writerow(fieldnames)
+            header_index = {name: idx for idx, name in enumerate(fieldnames)}
+            event_id_idx = header_index.get('EventId')
+            event_template_idx = header_index.get('EventTemplate')
+            parameter_idx = header_index.get('ParameterList')
+            content_idx = header_index.get('Content')
             for row, cluster_index in zip(reader, row_cluster_indices):
-                cluster = logCluL[cluster_index]
-                event_id, event_template, _ = self._event_row_for_cluster(cluster)
-                row['EventId'] = event_id
-                row['EventTemplate'] = event_template
-                if self.keep_para:
-                    row['ParameterList'] = self.get_parameter_list({'EventTemplate': event_template, 'Content': row['Content']})
+                event_id, event_template, _ = cluster_rows[cluster_index]
+                if event_id_idx is not None:
+                    row[event_id_idx] = event_id
+                if event_template_idx is not None:
+                    row[event_template_idx] = event_template
+                if self.keep_para and parameter_idx is not None and content_idx is not None:
+                    row[parameter_idx] = self.get_parameter_list(
+                        {'EventTemplate': event_template, 'Content': row[content_idx]}
+                    )
                 writer.writerow(row)
 
     def _template_stats(self, template):

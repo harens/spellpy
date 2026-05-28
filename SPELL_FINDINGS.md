@@ -52,6 +52,19 @@ The parser now records:
 - elapsed parse time;
 - guardrail skips.
 
+## BGL training benchmark
+
+I also ran bounded BGL-tail replays from
+`/Users/harensamarasinghe/Documents/Imperial/Year 4/Final Year Project/toolkits/AnomaLog/data/BGL/BGL.log`
+with input write time measured separately from parser time.
+
+Observed on structured message text only:
+
+- 100k lines: sample write `0.039s`, full parse `1.167s`, training-only parse without final CSV materialization `0.980s`, `23` clusters.
+- 200k lines: sample write `0.069s`, full parse `2.488s`, training-only parse without final CSV materialization `2.209s`, `45` clusters.
+
+The write cost was negligible. The largest avoidable cost in the BGL path was the final structured-output rewrite, not the core Spell matching loop or the line-count prepass. The rewrite path is now cheaper because cluster-level event metadata is cached once and the CSV pass no longer uses dict-based row handling.
+
 ## Paper comparison
 
 The implementation still follows the paper's overall streaming structure:
